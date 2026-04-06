@@ -31,7 +31,7 @@ Place `coding-agent.el` in your load path and add to your configuration:
 
 ```elisp
 (use-package coding-agent
-  :straight (:local-repo "path/to/coding-agent"))
+  :straight (:local-repo "~/GITHUB/coding-agent"))
 ```
 
 ## Quick Start
