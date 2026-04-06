@@ -1,4 +1,3 @@
-================================================================================
                          CODING-AGENT.EL DOCUMENTATION
                    LLM-Powered Coding Agent for Emacs using gptel
 ================================================================================
@@ -22,7 +21,6 @@ TABLE OF CONTENTS
 10. Command Reference
 11. License
 
-================================================================================
 1. OVERVIEW
 ================================================================================
 
@@ -31,7 +29,6 @@ the gptel package. It allows you to send coding instructions to a language
 model and review/apply the proposed changes through an interactive ediff
 session.
 
-================================================================================
 2. FEATURES
 ================================================================================
 
@@ -41,9 +38,8 @@ session.
 - Language-aware: Automatic detection and evaluation for multiple languages
 - Seamless integration: Works with your existing gptel backend configuration
 
-![Emacs Coding Agent screen shot](documentation/coding-agent.jpg)
+![Emacs Coding Agent screen shot](coding-agent.jpg)
 
-================================================================================
 3. REQUIREMENTS
 ================================================================================
 
@@ -56,7 +52,6 @@ External tools:
 - rg (ripgrep) or find - for project file discovery
 - diff - for generating unified diffs
 
-================================================================================
 4. INSTALLATION
 ================================================================================
 
@@ -65,7 +60,6 @@ Place coding-agent.el in your load path and add to your configuration:
     (use-package coding-agent
       :straight (:local-repo "path/to/coding-agent"))
 
-================================================================================
 5. QUICK START
 ================================================================================
 
@@ -75,7 +69,6 @@ Place coding-agent.el in your load path and add to your configuration:
 4. Review the diff in ediff
 5. Press q and answer y to apply changes
 
-================================================================================
 6. USAGE GUIDE
 ================================================================================
 
@@ -138,7 +131,6 @@ Runs the appropriate checker/evaluator for the buffer's language:
   - Common Lisp  → slime-compile-and-load-file
   - Clojure      → cider-load-buffer
 
-================================================================================
 7. KEYBINDINGS REFERENCE
 ================================================================================
 
@@ -151,7 +143,6 @@ Runs the appropriate checker/evaluator for the buffer's language:
 | C-c l r | my-llm-send-region-or-buffer  | Raw gptel chat                 |
 | C-c l c | gptel-chat                    | Open gptel chat buffer         |
 
-================================================================================
 8. SUPPORTED LANGUAGES
 ================================================================================
 
@@ -171,7 +162,6 @@ Java            | .java
 Emacs Lisp      | .el
 Shell           | .sh, .bash, .zsh
 
-================================================================================
 9. CONFIGURATION
 ================================================================================
 
@@ -192,7 +182,6 @@ Example Ollama configuration (included in coding-agent.el):
   (setq gptel-backend my-ollama-backend
         gptel-model  'glm-5:cloud)
 
-================================================================================
 10. COMMAND REFERENCE
 ================================================================================
 
@@ -212,10 +201,8 @@ ca-eval-buffer-for-language
 ca-help
   Display a short usage cheatsheet in *Messages*.
 
-================================================================================
 11. LICENSE
 ================================================================================
 
-GPL-3.0
+GPL-3.0 Licensed
 
-================================================================================
