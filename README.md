@@ -4,7 +4,7 @@ An LLM-powered coding agent for Emacs using [gptel](https://github.com/karthink/
 
 Make sure you read the material in the documentation directory.
 
-Please note that I used early version of `coding-agent.el` to both develop later versions and to help build the documentation.
+Please note that I used early versions of `coding-agent.el` to both develop later versions and to help build the documentation.
 
 ## Features
 
@@ -13,6 +13,8 @@ Please note that I used early version of `coding-agent.el` to both develop later
 - **Interactive diff review**: Review proposed changes via ediff before accepting
 - **Language-aware**: Automatic detection and evaluation for multiple languages
 - **Seamless integration**: Works with your existing gptel backend configuration
+
+Screenshot showing using `coding-agent.el` on a multi-file Clojure project:
 
 ![Emacs Coding Agent screen shot](documentation/coding-agent.jpg)
 
