@@ -2,6 +2,10 @@
 
 An LLM-powered coding agent for Emacs using [gptel](https://github.com/karthink/gptel).
 
+Make sure you read the material in the documentation directory.
+
+Please note that I used early version of `coding-agent.el` to both develop later versions and to help build the documentation.
+
 ## Features
 
 - **Single-file mode**: Send coding instructions to an LLM for the current buffer
