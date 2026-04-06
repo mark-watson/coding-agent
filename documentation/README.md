@@ -56,7 +56,7 @@ External tools:
 Place coding-agent.el in your load path and add to your configuration:
 
     (use-package coding-agent
-      :straight (:local-repo "path/to/coding-agent"))
+      :straight (:local-repo "~/GITHUB/coding-agent"))
 
 ## 5. QUICK START
 
