@@ -6,7 +6,7 @@ An LLM-powered coding agent for Emacs using [gptel](https://github.com/karthink/
 
 Please note that I used early versions of `coding-agent.el` to both develop later versions and to help build the documentation.
 
-Note: as of April 8, 2026 I find it necessary to load then project manually using the little function **ll**. Here is part of my **~/.emacs** file:
+Note: as of April 8, 2026 I find it necessary to load the project manually using the little function **ll**. Here is part of my **~/.emacs** file:
 
 ```lisp
 ;;(use-package coding-agent
