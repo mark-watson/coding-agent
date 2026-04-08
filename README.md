@@ -2,10 +2,25 @@
 
 An LLM-powered coding agent for Emacs using [gptel](https://github.com/karthink/gptel).
 
-Make sure you read the material in the documentation directory.
+**Make sure you read the material in the documentation directory.**
 
 Please note that I used early versions of `coding-agent.el` to both develop later versions and to help build the documentation.
 
+Note: as of April 8, 2026 I find it necessary to load then project manually using the little function **ll**. Here is part of my **~/.emacs** file:
+
+```lisp
+;;(use-package coding-agent
+;;  :straight (:local-repo "~/GITHUB/coding-agent"))
+
+;; --- for dev only ---
+
+(defun ll ()
+  "Load the active coding-agent.el project."
+  (interactive)
+  (load-file "/Users/markwatson/GITHUB/coding-agent/coding-agent.el")
+  (message "Loaded coding-agent.el"))
+```
+  
 ## Features
 
 - **Single-file mode**: Send coding instructions to an LLM for the current buffer
