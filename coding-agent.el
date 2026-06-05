@@ -93,11 +93,11 @@
   (defvar my-ollama-backend
     (gptel-make-ollama "Ollama"
       :host "localhost:11434"
-      :models '(glm-5:cloud)
+      :models '(gemma4:12b-it-qat)
       :stream t))
 
   (setq gptel-backend my-ollama-backend
-        gptel-model  'glm-5:cloud)
+        gptel-model  'gemma4:12b-it-qat)
 
   (defun my-llm-send-region-or-buffer ()
     (interactive)
