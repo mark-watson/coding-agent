@@ -44,6 +44,7 @@
 ;;   C-c a e  coding-agent-eval-buffer-for-language
 ;;   C-c a .  coding-agent-dispatch               transient menu
 ;;   C-c a m  coding-agent-model-change           switch provider/model
+;;   C-c a g  coding-agent-reset                  clear a stuck in-progress flag
 ;;   C-c a h  coding-agent-help
 ;;   C-c l r  coding-agent-send-region-or-buffer  raw gptel request
 ;;   C-c l c  coding-agent-open-chat              gptel chat buffer
@@ -199,6 +200,11 @@ Set by `coding-agent-model-change'; defaults to Fireworks.ai.")
   "Return the provider plist for KEY, or nil."
   (cdr (assq key coding-agent--providers)))
 
+(defun coding-agent--provider-label ()
+  "Return the label of the active provider (or its symbol name as a fallback)."
+  (or (plist-get (coding-agent--provider coding-agent-provider) :label)
+      (format "%s" coding-agent-provider)))
+
 ;; Heal a stale selection: if `coding-agent-provider' names a provider that no
 ;; longer exists (e.g. one was removed and the file reloaded), fall back to the
 ;; default so the agent never runs with an unknown provider or a nil backend.
@@ -256,8 +262,9 @@ running server when reachable, falling back to the static models in PLIST."
   "Switch the provider and model the coding agent uses.
 Only providers whose API-key environment variable is set are offered;
 providers that need no key are always available.  When Ollama (local) is
-chosen, its models are read from the running server.  The model prompt accepts
-a name that is not in the list, so you can use any model your provider serves."
+chosen, its models are read from the running server.  A model name that is not
+in the offered list is accepted only after confirmation, so a typo does not
+silently become a request for a nonexistent model."
   (interactive)
   (let* ((keys    (cl-remove-if-not #'coding-agent--provider-available-p
                                     (mapcar #'car coding-agent--providers)))
@@ -273,9 +280,11 @@ a name that is not in the list, so you can use any model your provider serves."
       (user-error "coding-agent: no provider selected (still using %s)" current))
     (let* ((plist (coding-agent--provider key))
            (cands (coding-agent--model-candidates key plist))
+           ;; `confirm' lets you still enter a model that is not listed, but a
+           ;; partial or mistyped name is caught before it becomes a 404.
            (model (cond ((null cands)       (read-string "Model: "))
                         ((null (cdr cands)) (car cands))
-                        (t (completing-read "Model: " cands nil nil nil nil
+                        (t (completing-read "Model: " cands nil 'confirm nil nil
                                             (car cands))))))
       (when (or (null model) (string= model ""))
         (user-error "coding-agent: no model selected (still using %s)" current))
@@ -285,12 +294,25 @@ a name that is not in the list, so you can use any model your provider serves."
       (message "coding-agent: now using %s / %s"
                (plist-get plist :label) coding-agent-model))))
 
+(defun coding-agent--ensure-model-registered ()
+  "Ensure `coding-agent-model' is listed in `coding-agent-backend's models.
+gptel's `gptel--sanitize-model' silently resets `gptel-model' to a backend's
+first model when the requested model is not in that backend's :models list.
+Registering the model keeps our selection -- for example an Ollama model picked
+from `ollama list' -- from being swapped out (which would send the wrong model
+and 404)."
+  (let ((models (gptel-backend-models coding-agent-backend)))
+    (unless (member coding-agent-model models)
+      (setf (gptel-backend-models coding-agent-backend)
+            (cons coding-agent-model models)))))
+
 (defun coding-agent--request (prompt &rest args)
   "Send PROMPT via `gptel-request', forcing the agent's backend and model.
 ARGS are forwarded to `gptel-request' unchanged.  Binding `gptel-backend' and
 `gptel-model' here makes the agent use the provider chosen with
 `coding-agent-model-change' regardless of any global gptel configuration."
   (coding-agent--ensure-key)
+  (coding-agent--ensure-model-registered)
   (let ((gptel-backend coding-agent-backend)
         (gptel-model coding-agent-model))
     (apply #'gptel-request prompt args)))
@@ -757,11 +779,18 @@ Use this if a request failed in a way that left the buffer marked busy."
   (message "coding-agent: cleared in-progress flag for %s" (buffer-name)))
 
 (defun coding-agent--report-error (info)
-  "Report a gptel error described by INFO in a readable form."
-  (message "coding-agent: request failed: %s"
-           (or (plist-get info :status)
-               (plist-get info :error)
-               info)))
+  "Report a gptel error described by INFO in a readable form.
+Includes the HTTP status and the provider error message when present, such as
+the model-not-found reply from Ollama that usually causes a 404 on /api/chat."
+  (let* ((status (or (plist-get info :http-status) (plist-get info :status)))
+         (err    (plist-get info :error))
+         (detail (cond ((null err) nil)
+                       ((stringp err) err)
+                       ((and (listp err) (plist-get err :message)) (plist-get err :message))
+                       (t (format "%S" err)))))
+    (message "coding-agent: request failed%s%s"
+             (if status (format " (%s)" status) "")
+             (if detail (concat ": " detail) ""))))
 
 (defun coding-agent--stash-raw (text &optional name)
   "Store TEXT in buffer NAME (default *coding-agent-raw*) for inspection."
@@ -824,7 +853,8 @@ never left stuck as \"in progress\"."
          (lang   (coding-agent--buffer-language src))
          (source (buffer-substring-no-properties (point-min) (point-max)))
          (prompt (coding-agent--build-prompt lang source instruction)))
-    (message "coding-agent: sending %s buffer to the LLM..." lang)
+    (message "coding-agent: sending %s buffer to %s (%s)..."
+             lang (coding-agent--provider-label) coding-agent-model)
     (coding-agent--dispatch src prompt source)))
 
 (defun coding-agent-refine (instruction)
@@ -837,7 +867,8 @@ This gives iterative refinement without re-typing the whole request."
                    (buffer-substring-no-properties (point-min) (point-max))))
          (lang (coding-agent--buffer-language src))
          (prompt (coding-agent--build-prompt lang base instruction)))
-    (message "coding-agent: refining...")
+    (message "coding-agent: refining with %s (%s)..."
+             (coding-agent--provider-label) coding-agent-model)
     (coding-agent--dispatch src prompt base)))
 
 ;; ---------------------------------------------------------------------------
@@ -944,9 +975,10 @@ buffer's language, warns about size, and reviews each returned file."
 ;; ---------------------------------------------------------------------------
 
 (defun coding-agent-open-chat ()
-  "Open (or switch to) a gptel chat buffer on the Fireworks backend."
+  "Open (or switch to) a gptel chat buffer on the active backend."
   (interactive)
   (coding-agent--ensure-key)
+  (coding-agent--ensure-model-registered)
   (let ((gptel-backend coding-agent-backend)
         (gptel-model coding-agent-model))
     (pop-to-buffer (gptel "*coding-agent-chat*"))))
@@ -1009,7 +1041,7 @@ buffer's language, warns about size, and reviews each returned file."
     "  C-c a r  run (file)      C-c a p  run (project)\n"
     "  C-c a f  refine last     C-c a a  apply proposed\n"
     "  C-c a e  eval/check      C-c a .  menu   C-c a h  help\n"
-    "  C-c a m  change model/provider\n"
+    "  C-c a m  change model/provider   C-c a g  reset busy flag\n"
     "  C-c l r  send region     C-c l c  chat buffer\n"
     "Flow: run -> read *coding-agent-diff* -> answer y to apply (or M-x coding-agent-apply-proposed)")))
 
@@ -1023,6 +1055,7 @@ buffer's language, warns about size, and reviews each returned file."
    ["Other"
     ("e" "Eval / check buffer"    coding-agent-eval-buffer-for-language)
     ("m" "Model / provider"       coding-agent-model-change)
+    ("g" "Reset busy flag"        coding-agent-reset)
     ("c" "Chat: region/buffer"    coding-agent-send-region-or-buffer)
     ("C" "Open chat buffer"       coding-agent-open-chat)
     ("h" "Help"                   coding-agent-help)]])
@@ -1039,6 +1072,7 @@ buffer's language, warns about size, and reviews each returned file."
     (define-key map (kbd "a") #'coding-agent-apply-proposed)
     (define-key map (kbd "e") #'coding-agent-eval-buffer-for-language)
     (define-key map (kbd "m") #'coding-agent-model-change)
+    (define-key map (kbd "g") #'coding-agent-reset)
     (define-key map (kbd "h") #'coding-agent-help)
     (define-key map (kbd ".") #'coding-agent-dispatch)
     map)

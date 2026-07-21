@@ -22,10 +22,11 @@ TABLE OF CONTENTS
 8. Supported Languages
 9. Configuration
    9.1 Customization Variables
-   9.2 Backend and Model
+   9.2 Backend, Model, and Provider Switching
    9.3 Safety and Privacy
 10. Command Reference
-11. License
+11. Troubleshooting
+12. License
 
 ## 1. OVERVIEW
 
@@ -296,6 +297,7 @@ Active when coding-agent-mode (or global-coding-agent-mode) is on.
 | C-c a e | coding-agent-eval-buffer-for-language  | Evaluate / syntax-check buffer  |
 | C-c a . | coding-agent-dispatch                  | Transient command menu          |
 | C-c a m | coding-agent-model-change              | Switch provider / model         |
+| C-c a g | coding-agent-reset                     | Clear a stuck in-progress flag  |
 | C-c a h | coding-agent-help                      | Show the cheatsheet             |
 | C-c l r | coding-agent-send-region-or-buffer     | Raw request (region/buffer)     |
 | C-c l c | coding-agent-open-chat                 | Open a gptel chat buffer        |
@@ -417,11 +419,15 @@ coding-agent-model-change
   Switch the provider and model the agent uses (section 9.2). Only providers whose
   API-key variable is set are offered.
 
+coding-agent-reset
+  Clear the "in progress" flag for the current buffer. Use it if a request failed in a
+  way that left the buffer marked busy (see section 11).
+
 coding-agent-send-region-or-buffer
   Send the region, or the whole buffer, as a raw request and show the reply.
 
 coding-agent-open-chat
-  Open (or switch to) a gptel chat buffer on the Fireworks backend.
+  Open (or switch to) a gptel chat buffer on the active backend.
 
 coding-agent-dispatch
   Open the transient command menu.
@@ -432,6 +438,32 @@ coding-agent-help
 coding-agent-mode / global-coding-agent-mode
   Minor mode (and its globalized form) that install the C-c a / C-c l keybindings.
 
-## 11. LICENSE
+## 11. TROUBLESHOOTING
+
+"a request for this buffer is already in progress"
+  The buffer is marked busy. A request normally clears this when it finishes or fails,
+  but if one was interrupted the flag can linger. Run coding-agent-reset (C-c a g) in
+  that buffer to clear it, then try again.
+
+Connection errors after switching to Ollama (local)
+  The agent talks to a local Ollama server at localhost:11434; make sure it is running
+  (`ollama serve`, or the Ollama app) and that the model you selected is pulled
+  (`ollama pull <model>`). coding-agent-model-change reads the installed models with
+  `ollama list`, so if that command shows nothing the server is not reachable.
+
+"request failed (404) ... model not found" (Ollama)
+  Ollama answers 404 on /api/chat when the requested model is not installed under that
+  exact name. Each run echoes the model being sent -- "sending ... to Ollama (local)
+  (MODEL)..." -- and the failure shows Ollama's own message. Confirm MODEL appears in
+  `ollama list`; if not, `ollama pull MODEL` or re-run coding-agent-model-change and
+  choose a listed name. (The agent registers your chosen model with its backend before
+  each request, so gptel does not silently substitute the backend's first model.)
+
+"Provider (current: nil)" / "no active provider"
+  The active provider became invalid (for example a previously selected provider was
+  later removed). The library now heals this to the default (Fireworks.ai) on load;
+  otherwise just run coding-agent-model-change (C-c a m) and pick a provider.
+
+## 12. LICENSE
 
 GPL-3.0 Licensed

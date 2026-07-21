@@ -134,6 +134,7 @@ Active when `coding-agent-mode` (or `global-coding-agent-mode`) is on:
 | `C-c a e` | `coding-agent-eval-buffer-for-language` | Evaluate / syntax-check the buffer |
 | `C-c a .` | `coding-agent-dispatch` | Transient command menu |
 | `C-c a m` | `coding-agent-model-change` | Switch provider / model |
+| `C-c a g` | `coding-agent-reset` | Clear a stuck in-progress flag |
 | `C-c a h` | `coding-agent-help` | Show the cheatsheet |
 | `C-c l r` | `coding-agent-send-region-or-buffer` | Send region/buffer as a raw request |
 | `C-c l c` | `coding-agent-open-chat` | Open a gptel chat buffer |
