@@ -125,11 +125,13 @@ Guards against silently accepting a truncated model response."
   (lambda () (getenv name)))
 
 (defvar coding-agent-fireworks-models
-  '(accounts/fireworks/models/deepseek-v4-flash)
+  '(accounts/fireworks/models/deepseek-v4-flash
+    accounts/fireworks/models/deepseek-v4-flash-0731)
   "Models offered for the Fireworks.ai provider.")
 
 (defvar coding-agent-ollama-local-models
-  '(qwen3:latest llama3.2:latest deepseek-r1:latest)
+  '(qwen3:latest llama3.2:latest deepseek-r1:latest
+    nemotron-3.5-lightning:30b-mlx)
   "Fallback models for a local Ollama server.
 `coding-agent-model-change' normally reads the installed models from the
 running server; this list is used only when the server cannot be reached.")
