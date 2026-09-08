@@ -1,7 +1,7 @@
 ;;; coding-agent.el --- LLM-powered coding agent using gptel -*- lexical-binding: t; -*-
 
 ;; Author: Mark Watson
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1") (gptel "0.9"))
 ;; Keywords: tools, convenience, llm
 
@@ -13,6 +13,11 @@
 ;;
 ;;   * single file   -- `coding-agent-run'          (C-c a r)
 ;;   * whole project -- `coding-agent-run-project'   (C-c a p)
+;;
+;; A third, agentic scope is available with `coding-agent-agent-run' (C-c a R):
+;; the model drives a multi-turn session using tools (read_file, list_dir,
+;; grep, run_shell with a whitelist, and propose_edit with a per-file diff
+;; review) instead of receiving files up front.
 ;;
 ;; The model may answer either with the COMPLETE new file, or with one or more
 ;; search/replace blocks:
@@ -27,18 +32,28 @@
 ;; is not found is reported and skipped rather than corrupting the file.  When
 ;; the response contains no blocks it is treated as a whole-file replacement.
 ;;
+;; Reviews offer yes/no/skip: answering "skip" asks for a one-line reason that
+;; is folded into the next request so the model adjusts instead of blindly
+;; retrying.  When `coding-agent-check-command' names a Makefile target
+;; (e.g. "check"), it runs after every applied edit and its output is shown;
+;; failures can be fed back to the model as a follow-up.
+;;
 ;; This file configures its own gptel backend.  It defaults to Fireworks.ai
 ;; (model `accounts/fireworks/models/deepseek-v4-flash'), reading the API key
 ;; from the FIREWORKS_API_KEY environment variable, and can switch at runtime
 ;; between Fireworks.ai, a local Ollama server, and the Anthropic API with
-;; `coding-agent-model-change' (C-c a m).  A provider whose API-key environment
-;; variable is unset is not offered.  It does not enable its keybindings on
-;; load; call `(global-coding-agent-mode 1)' in your init (see
-;; `coding-agent-config.el' for an example).
+;; `coding-agent-model-change' (C-c a m).  Additional OpenAI-compatible or
+;; Ollama-style providers can be declared without any elisp in
+;; ~/.coding_harness.json plus a per-project .coding_agent_harness.json
+;; override (see `coding-agent-reload-harness-config').  A provider whose
+;; API-key environment variable is unset is not offered.  It does not enable
+;; its keybindings on load; call `(global-coding-agent-mode 1)' in your init
+;; (see `coding-agent-config.el' for an example).
 ;;
 ;; Key commands (active when `coding-agent-mode' is on):
 ;;   C-c a r  coding-agent-run                    edit the current file
 ;;   C-c a p  coding-agent-run-project            edit across the project
+;;   C-c a R  coding-agent-agent-run              agentic session with tools
 ;;   C-c a f  coding-agent-refine                 follow-up on the last result
 ;;   C-c a a  coding-agent-apply-proposed         apply the stashed proposal
 ;;   C-c a e  coding-agent-eval-buffer-for-language
@@ -46,6 +61,7 @@
 ;;   C-c a m  coding-agent-model-change           switch provider/model
 ;;   C-c a g  coding-agent-reset                  clear a stuck in-progress flag
 ;;   C-c a h  coding-agent-help
+;;   C-c a /  coding-agent-load-skill             load a ~/.agents skill
 ;;   C-c l r  coding-agent-send-region-or-buffer  raw gptel request
 ;;   C-c l c  coding-agent-open-chat              gptel chat buffer
 
@@ -58,6 +74,7 @@
 (require 'cl-lib)
 (require 'diff)            ; diff-no-select for the review buffer
 (require 'diff-mode)
+(require 'json)
 (require 'transient)
 
 ;; ---------------------------------------------------------------------------
@@ -108,6 +125,48 @@ Guards against silently accepting a truncated model response."
     "id_rsa" "id_dsa" "id_ecdsa" "id_ed25519" "*credential*" "*secret*")
   "Filename globs that are never sent to the LLM in project mode."
   :type '(repeat string))
+
+(defcustom coding-agent-dry-run nil
+  "When non-nil, show diffs but never modify buffers or files."
+  :type 'boolean)
+
+(defcustom coding-agent-auto-approve nil
+  "When non-nil, apply proposals without asking (the diff is still shown).
+The post-apply check from `coding-agent-check-command' still runs."
+  :type 'boolean)
+
+(defcustom coding-agent-check-command "check"
+  "Name of a Makefile target run after an applied edit, or nil to disable.
+The command is run as \"make TARGET\" in the project root.  Its output
+(truncated to `coding-agent-check-max-output' characters) is shown and,
+on failure, can be fed back to the model as a follow-up."
+  :type '(choice (const :tag "Disabled" nil) string))
+
+(defcustom coding-agent-check-max-output 2000
+  "Maximum characters of `coding-agent-check-command' output to keep."
+  :type 'integer)
+
+(defcustom coding-agent-review-save-window-config t
+  "When non-nil, restore the window layout after a diff review finishes."
+  :type 'boolean)
+
+(defcustom coding-agent-skills-directory "~/.agents/skills"
+  "Directory containing skill subdirectories, each holding a SKILL.md file.
+Skills are shared with command-line coding agents that use the same layout."
+  :type 'directory)
+
+(defcustom coding-agent-search-engine 'brave
+  "Web search backend used by `coding-agent-enrich-with-search': brave or exa."
+  :type '(choice (const brave) (const exa)))
+
+(defcustom coding-agent-shell-command-whitelist
+  '("make" "ls" "pwd" "cat" "rg" "grep" "git" "uv")
+  "Commands the agentic run_shell tool is allowed to execute."
+  :type '(repeat string))
+
+(defcustom coding-agent-agent-max-iterations 20
+  "Upper bound on model round-trips in a single agentic session."
+  :type 'integer)
 
 ;; ---------------------------------------------------------------------------
 ;; Inference backends and provider switching
@@ -184,7 +243,159 @@ Requests raise the model context window to `coding-agent-ollama-num-ctx'.")
   "Registry of selectable providers.
 Each entry is (KEY :label STR :backend BACKEND :models LIST :env VAR-OR-NIL).
 A provider is offered by `coding-agent-model-change' only when its :env is nil
-or that environment variable is set.")
+or that environment variable is set.  Additional providers from
+`~/.coding_harness.json' / project-local `.coding_agent_harness.json'
+are appended here by `coding-agent-load-harness-config'.")
+
+;; Declared here (defined below) so the config loader compiles cleanly.
+(defvar coding-agent-model)
+(defvar coding-agent-backend)
+(defvar coding-agent-provider)
+
+;; ---------------------------------------------------------------------------
+;; JSON harness config (~/.coding_harness.json + project-local override)
+;; Format (all sections optional):
+;;   { "default_provider": "mlx",
+;;     "providers": { "<name>": { "type": "openai" | "mlx" | "ollama",
+;;                                "endpoint": "https://.../v1/chat/completions",
+;;                                "api_key_env": "SOME_KEY",   (optional)
+;;                                "model": "model-id",
+;;                                "generation": {"temperature": 0.6,
+;;                                               "max_tokens": 32768} } } }
+;; "type": "openai" maps to an OpenAI-compatible gptel backend; "mlx" and the
+;; legacy "ollama" both map to an Ollama-style gptel backend (which also
+;; speaks to MLX/Ollama OpenAI-compatible shims at the given endpoint).
+;; Project-local entries deep-merge over (and win against) the global file.
+;; ---------------------------------------------------------------------------
+
+(defun coding-agent--harness-config-files ()
+  "Return (GLOBAL-FILE . LOCAL-FILE) paths for the harness config."
+  (cons (expand-file-name "~/.coding_harness.json")
+        (expand-file-name ".coding_agent_harness.json" default-directory)))
+
+(defun coding-agent--read-json-object (file)
+  "Return FILE parsed as a JSON object (alist), or nil if missing/invalid."
+  (when (file-readable-p file)
+    (condition-case nil
+        (let ((v (json-read-file file)))
+          (and (listp v) v))
+      (error nil))))
+
+(defun coding-agent--json-merge (global local)
+  "Recursively merge alists GLOBAL and LOCAL; LOCAL wins on conflicts.
+Non-alist values are replaced wholesale."
+  (if (not (and (listp global) (listp local)))
+      (or local global)
+    (let ((result (copy-alist global)))
+      (dolist (pair local)
+        (let* ((key (car pair))
+               (prev (assq key result)))
+          (setq result
+                (if (and prev (listp (cdr prev)) (listp (cdr pair)))
+                    (cons (cons key (coding-agent--json-merge (cdr prev) (cdr pair)))
+                          (assq-delete-all key result))
+                  (cons pair (assq-delete-all key result))))))
+      result)))
+
+(defun coding-agent--json-string (obj key)
+  "Return the string value at KEY in alist OBJ, or nil."
+  (let ((v (cdr (assq key obj))))
+    (and (stringp v) (not (string-empty-p v)) v)))
+
+(defun coding-agent--endpoint-to-host (endpoint)
+  "Return \"host[:port]\" for gptel from an http(s) ENDPOINT URL."
+  (when endpoint
+    (let* ((s (string-remove-suffix "/" endpoint))
+           (s (replace-regexp-in-string "\\`https?://" "" s)))
+      (car (split-string s "/")))))
+
+(defun coding-agent--endpoint-to-path (endpoint)
+  "Return the URL path component of ENDPOINT, with leading \"/\"."
+  (when endpoint
+    (let ((u (url-generic-parse-url endpoint)))
+      (and (url-filename u)
+           (if (string-prefix-p "/" (url-filename u))
+               (url-filename u)
+             (concat "/" (url-filename u)))))))
+
+(defun coding-agent--provider-from-profile (name profile)
+  "Build a provider entry from a JSON provider PROFILE named NAME.
+Return (KEY :label ... :backend ... :models ... :env ...), or nil."
+  (let* ((type     (downcase (or (coding-agent--json-string profile 'type) "openai")))
+         (endpoint (coding-agent--json-string profile 'endpoint))
+         (model    (coding-agent--json-string profile 'model))
+         (key-env  (coding-agent--json-string profile 'api_key_env))
+         (gen      (cdr (assq 'generation profile)))
+         (max-tok  (and (listp gen) (cdr (assq 'max_tokens gen))))
+         (temp     (and (listp gen) (cdr (assq 'temperature gen))))
+         (models   (list (intern (or model "default"))))
+         (key      (intern name)))
+    (cond
+     ;; Local MLX server / Ollama-style endpoint: gptel's ollama backend.
+     ((member type '("mlx" "ollama"))
+      `(,key :label ,name
+        :backend ,(gptel-make-ollama (copy-sequence name)
+                    :host (or (coding-agent--endpoint-to-host endpoint)
+                              "localhost:11434")
+                    :stream t
+                    :models models
+                    :request-params `(:options (:num_ctx ,coding-agent-ollama-num-ctx)))
+        :models ,models :env nil))
+     ;; OpenAI-compatible REST endpoint (Fireworks and compatible servers).
+     (t
+      (let ((host (or (coding-agent--endpoint-to-host endpoint)
+                      "api.fireworks.ai"))
+            (path (or (coding-agent--endpoint-to-path endpoint)
+                      "/inference/v1/chat/completions"))
+            (req  (append (when (numberp temp) `(:temperature ,temp))
+                          (when (integerp max-tok) `(:max_tokens ,max-tok)))))
+        (unless key-env
+          (setq key-env "FIREWORKS_API_KEY")) ; profile type openai w/o key: reuse default var
+        `(,key :label ,name
+          :backend ,(apply #'gptel-make-openai (copy-sequence name)
+                           :host host :endpoint path :stream t :models models
+                           (append (list :key (coding-agent--env-key key-env))
+                                   (when req (list :request-params req))))
+          :models ,models :env ,key-env))))))
+
+(defun coding-agent-load-harness-config ()
+  "Load provider profiles from the global and project-local JSON config.
+Previously loaded profile providers are replaced, so re-run this after
+editing the files (or switching projects).  Profiles are appended to
+`coding-agent--providers'; when the merged config names a
+\"default_provider\" profile, it is activated.  Return profile names."
+  (interactive)
+  (let* ((files (coding-agent--harness-config-files))
+         (global (coding-agent--read-json-object (car files)))
+         (local  (coding-agent--read-json-object (cdr files)))
+         (names '()))
+    ;; Drop previously-loaded profile providers (tagged :profile t).
+    (setq coding-agent--providers
+          (cl-remove-if (lambda (e) (plist-get (cdr e) :profile))
+                        coding-agent--providers))
+    (when-let* ((merged (and (or global local)
+                             (coding-agent--json-merge global local)))
+                (profiles (cdr (assq 'providers merged))))
+      (dolist (entry profiles)
+        (let ((prov (coding-agent--provider-from-profile
+                     (symbol-name (car entry)) (cdr entry))))
+          (when prov
+            (plist-put (cdr prov) :profile t)
+            (push (car prov) names)
+            (setq coding-agent--providers
+                  (append coding-agent--providers (list prov))))))
+      (let* ((default (coding-agent--json-string merged 'default_provider))
+             (dkey    (and default (intern default))))
+        (when (and dkey (coding-agent--provider-available-p dkey))
+          (let ((p (coding-agent--provider dkey)))
+            (setq coding-agent-provider dkey
+                  coding-agent-backend  (plist-get p :backend)
+                  coding-agent-model    (or (car (plist-get p :models))
+                                            coding-agent-model))))))
+    (when (called-interactively-p 'any)
+      (message "coding-agent: harness profiles loaded: %s"
+               (if names (mapconcat #'symbol-name (nreverse names) ", ") "none")))
+    (nreverse names)))
 
 (defcustom coding-agent-model 'accounts/fireworks/models/deepseek-v4-flash
   "gptel model the coding agent currently sends its requests to.
@@ -429,6 +640,13 @@ Files with no extension (Makefile, Dockerfile, ...) count as text."
     (cl-some (lambda (glob) (string-match-p (wildcard-to-regexp glob) base))
              coding-agent-secret-globs)))
 
+(defun coding-agent--hidden-file-p (name)
+  "Return non-nil when NAME (a basename) is a dotfile or Emacs-internal file."
+  (or (string-prefix-p "." name)
+      (string-suffix-p "~" name)
+      (and (string-prefix-p "#" name) (string-suffix-p "#" name))
+      (string-suffix-p ".coding-agent.bak" name)))
+
 (defun coding-agent--extensions-for-language (lang)
   "Return the list of file extensions appropriate for LANG."
   (cdr (assoc lang coding-agent--language-extensions)))
@@ -436,6 +654,20 @@ Files with no extension (Makefile, Dockerfile, ...) count as text."
 ;; ---------------------------------------------------------------------------
 ;; Prompt construction
 ;; ---------------------------------------------------------------------------
+
+(defvar-local coding-agent--skills nil
+  "Alist of (NAME . CONTENT) of skills loaded into this buffer's requests.")
+
+(defvar coding-agent--search-results nil
+  "Most recent search block to prepend to the next prompt; cleared after use.")
+
+(defun coding-agent--skill-preamble ()
+  "Concatenated contents of loaded skills, or nil."
+  (when (and coding-agent--skills (listp coding-agent--skills))
+    (mapconcat (lambda (s)
+                 (format "The user has loaded the skill '%s'.  Use it as an authoritative reference.\n\n%s"
+                         (car s) (cdr s)))
+               coding-agent--skills "\n\n---\n\n")))
 
 (defconst coding-agent--protocol-help
   "Return your changes as one or more search/replace blocks in EXACTLY this form:
@@ -456,8 +688,14 @@ Rules:
   "Shared description of the accepted response format.")
 
 (defun coding-agent--build-prompt (language source instruction)
-  "Build a single-file LLM prompt for LANGUAGE, SOURCE and INSTRUCTION."
-  (format "You are an expert %s programmer.
+  "Build a single-file LLM prompt for LANGUAGE, SOURCE and INSTRUCTION.
+Loaded skills and `coding-agent--search-results' are prepended when set."
+  (let ((skills (coding-agent--skill-preamble))
+        (search (coding-agent--search-results)))
+    (concat
+     (when skills (concat skills "\n\n"))
+     (when search (concat search "\n\n"))
+     (format "You are an expert %s programmer.
 
 INSTRUCTION: %s
 
@@ -465,16 +703,22 @@ INSTRUCTION: %s
 
 CURRENT FILE:
 %s"
-          language instruction coding-agent--protocol-help source))
+             language instruction coding-agent--protocol-help source))))
 
 (defun coding-agent--build-project-prompt (language files-alist instruction)
   "Build a multi-file LLM prompt for LANGUAGE.
-FILES-ALIST is a list of (relative-path . content).  INSTRUCTION is the request."
+FILES-ALIST is a list of (relative-path . content).  INSTRUCTION is the request.
+Loaded skills and `coding-agent--search-results' are prepended when set."
   (let ((files-block
          (mapconcat (lambda (pair)
                       (format "FILE: %s\n%s\nEND_FILE" (car pair) (cdr pair)))
-                    files-alist "\n\n")))
-    (format "You are an expert %s programmer working on a multi-file project.
+                    files-alist "\n\n"))
+        (skills (coding-agent--skill-preamble))
+        (search (coding-agent--search-results)))
+    (concat
+     (when skills (concat skills "\n\n"))
+     (when search (concat search "\n\n"))
+     (format "You are an expert %s programmer working on a multi-file project.
 
 INSTRUCTION: %s
 
@@ -496,7 +740,7 @@ Do NOT include unchanged files.  Do NOT add commentary or markdown fences.
 
 PROJECT FILES:
 %s"
-            language instruction files-block)))
+             language instruction files-block))))
 
 ;; ---------------------------------------------------------------------------
 ;; Response parsing and edit application
@@ -670,18 +914,83 @@ across runs, so \"the diff buffer\" is always the same well-known buffer."
     (with-current-buffer diff-buf (goto-char (point-min)))
     diff-buf))
 
+(defconst coding-agent--review-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "S") #'coding-agent--review-skip)
+    map)
+  "Extra keys active in `*coding-agent-diff*' during a review.")
+
+(define-minor-mode coding-agent--review-mode
+  "Minor mode active in the review diff buffer; adds S for skip."
+  :lighter " CA-review"
+  :keymap coding-agent--review-map)
+
+(defvar coding-agent--review-skip-fn nil
+  "Function run by `coding-agent--review-skip' in the review buffer.")
+
+(defun coding-agent--review-mode-setup (buffer)
+  "Enable the review minor mode in BUFFER with a skip key."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local coding-agent--review-skip-fn
+                  (lambda (reason) (throw 'skip (cons 'skip reason))))
+      (coding-agent--review-mode 1))))
+
+(defun coding-agent--review-mode-teardown (buffer)
+  "Disable the review minor mode in BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer (coding-agent--review-mode -1))))
+
+(defun coding-agent--review-skip ()
+  "Skip the proposed change, asking for a one-line reason for the model."
+  (interactive)
+  (when (and (eq (current-buffer) (get-buffer "*coding-agent-diff*"))
+             coding-agent--review-skip-fn)
+    (funcall coding-agent--review-skip-fn (read-string "Reason (sent to model): "))))
+
+(defun coding-agent--review-prompt (prompt)
+  "PROMPT for the review outcome.
+Return one of `apply', `no' or (`skip' . REASON)."
+  (let ((key (read-key
+              (propertize (concat prompt "[y]es / [n]o / [s]kip with reason ")
+                          'face 'minibuffer-prompt))))
+    (pcase key
+      ((or ?y ?\r) 'apply)
+      ((or ?n ?\e) 'no)
+      (?s (cons 'skip (read-string "Reason (sent to model): ")))
+      (_ (message "coding-agent: please answer y, n or s")
+         (sit-for 1)
+         (coding-agent--review-prompt prompt)))))
+
 (defun coding-agent--review (src original proposed after-fn)
   "Show a diff of ORIGINAL vs PROPOSED for SRC, then ask whether to apply.
-AFTER-FN receives non-nil when the user chose to apply.  Review uses a plain
-`*coding-agent-diff*' buffer (visible in the buffer list); no ediff session and
-no proposed-buffer pop-up are created."
+AFTER-FN receives one of `apply', `no' or (`skip' . REASON).  The diff is
+shown in the reusable `*coding-agent-diff*' buffer; with
+`coding-agent-review-save-window-config' the window layout is restored
+afterwards, and with `coding-agent-auto-approve' the prompt is skipped."
   (let ((diff-buf (coding-agent--diff-strings original proposed
-                                              "*coding-agent-diff*")))
+                                              "*coding-agent-diff*"))
+        (winconf (and coding-agent-review-save-window-config
+                      (current-window-configuration))))
     (display-buffer diff-buf)
-    (let ((apply? (and (buffer-live-p src)
-                       (y-or-n-p (format "Apply proposed changes to %s? "
-                                         (buffer-name src))))))
-      (funcall after-fn apply?))))
+    (coding-agent--review-mode-setup diff-buf)
+    (unwind-protect
+        (let ((outcome
+               (cond
+                ((not (buffer-live-p src)) 'no)
+                (coding-agent-auto-approve
+                 (message "coding-agent: auto-approving changes to %s"
+                          (buffer-name src))
+                 'apply)
+                (coding-agent-dry-run 'no)
+                (t
+                 (catch 'skip
+                   (coding-agent--review-prompt
+                    (format "Apply proposed changes to %s? "
+                            (buffer-name src))))))))
+          (funcall after-fn outcome))
+      (coding-agent--review-mode-teardown diff-buf)
+      (when winconf (set-window-configuration winconf)))))
 
 (defun coding-agent--backup (buffer)
   "Copy BUFFER's file to FILE.coding-agent.bak if it exists."
@@ -709,36 +1018,117 @@ Only lisp-family languages are checked; others are assumed OK."
         (erase-buffer)
         (insert original)))))
 
+;; ---------------------------------------------------------------------------
+;; Post-apply test gate (`make check') and feedback plumbing
+;; ---------------------------------------------------------------------------
+
+(defvar coding-agent--pending-feedback nil
+  "Lines (skip reasons, check failures) folded into the next LLM request.")
+
+(defun coding-agent--add-feedback (text)
+  "Queue TEXT to be prepended to the next request's instruction."
+  (when (and text (not (string-empty-p text)))
+    (push text coding-agent--pending-feedback)))
+
+(defun coding-agent--consume-feedback ()
+  "Return queued feedback as one block of text, clearing the queue."
+  (prog1 (when coding-agent--pending-feedback
+           (concat "Feedback from the previous attempt:\n"
+                   (mapconcat #'identity
+                              (nreverse coding-agent--pending-feedback) "\n")))
+    (setq coding-agent--pending-feedback nil)))
+
+(defun coding-agent--truncate (text max)
+  "Return TEXT truncated to MAX characters with a note when cut."
+  (if (and text (> (length text) max))
+      (concat (substring text 0 max)
+              (format "\n... (truncated, %d total chars)" (length text)))
+    (or text "")))
+
+(defun coding-agent--project-check-root (near)
+  "Return a directory around NEAR containing a Makefile with a check target."
+  (when coding-agent-check-command
+    (let ((dir (locate-dominating-file
+                (or (and near (buffer-file-name near)) default-directory)
+                (lambda (d)
+                  (let ((mk (expand-file-name "Makefile" d)))
+                    (and (file-exists-p mk)
+                         (with-temp-buffer
+                           (insert-file-contents mk nil 0 50000)
+                           (goto-char (point-min))
+                           (re-search-forward
+                            (concat "^" (regexp-quote coding-agent-check-command) ":")
+                            nil t))))))))
+      dir)))
+
+(defun coding-agent--run-check (buffer)
+  "Run `make check' near BUFFER; offer to stash failures as model feedback.
+Return a status string, or nil when no check ran."
+  (let ((root (coding-agent--project-check-root
+               (and (bufferp buffer) buffer))))
+    (if (not (and root (not coding-agent-dry-run)))
+        "no check configured"
+      (let* ((default-directory root)
+             (out (with-temp-buffer
+                    (let ((code (process-file "make" nil t nil
+                                              coding-agent-check-command)))
+                      (cons code (buffer-string)))))
+             (code (car out))
+             (text (coding-agent--truncate (cdr out)
+                                           coding-agent-check-max-output)))
+        (if (zerop code)
+            "make check passed"
+          (coding-agent--stash-raw
+           (format "make %s failed (exit %d) in %s:\n\n%s"
+                   coding-agent-check-command code root text)
+           "*coding-agent-check*")
+          (when (y-or-n-p "make check FAILED; feed the output back to the model? ")
+            (coding-agent--add-feedback
+             (format "After your edit, `make %s` FAILED with this output:\n%s"
+                     coding-agent-check-command text)))
+          (format "make check FAILED (exit %d) -- see *coding-agent-check*" code))))))
+
 (defun coding-agent--apply-text (buffer text &optional original)
   "Replace BUFFER contents with TEXT.
-When ORIGINAL is given, guard against a suspiciously small (truncated)
-whole-file replacement and, if `coding-agent-check-after-apply', verify
-delimiters afterwards.  Saving only happens when
-`coding-agent-apply-saves-buffer' is non-nil."
+No-op when TEXT equals the current buffer contents.  When ORIGINAL is
+given, guard against a suspiciously small (truncated) whole-file
+replacement; if `coding-agent-check-after-apply', verify delimiters
+afterwards; and run the `coding-agent-check-command' test gate.
+Honors `coding-agent-dry-run' (never touches the buffer)."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and original (> (length original) 0)
-                 (< (/ (float (length text)) (length original))
-                    coding-agent-min-proposed-ratio)
-                 (not (yes-or-no-p
-                       (format "Proposed text is %d%% of the original size; apply anyway? "
-                               (round (* 100 (/ (float (length text))
-                                                (length original))))))))
-        (user-error "coding-agent: apply aborted"))
-      (when coding-agent-backup-on-apply
-        (coding-agent--backup buffer))
-      (let ((pos (point)))
-        (erase-buffer)
-        (insert text)
-        (unless (string-suffix-p "\n" text) (insert "\n"))
-        (goto-char (min pos (point-max))))
-      (when coding-agent-apply-saves-buffer
-        (save-buffer))
-      (when (and coding-agent-check-after-apply original)
-        (coding-agent--check-and-maybe-revert buffer original))
-      (message "coding-agent: applied changes to %s (%s)"
-               (buffer-name buffer)
-               (if coding-agent-apply-saves-buffer "saved" "unsaved")))))
+      (cond
+       (coding-agent-dry-run
+        (message "coding-agent: dry-run; %s left untouched" (buffer-name buffer)))
+       ((and original (string= text
+                               (buffer-substring-no-properties
+                                (point-min) (point-max))))
+        (message "coding-agent: no changes (proposal matches current buffer)"))
+       (t
+        (when (and original (> (length original) 0)
+                   (< (/ (float (length text)) (length original))
+                      coding-agent-min-proposed-ratio)
+                   (not (yes-or-no-p
+                         (format "Proposed text is %d%% of the original size; apply anyway? "
+                                 (round (* 100 (/ (float (length text))
+                                                  (length original))))))))
+          (user-error "coding-agent: apply aborted"))
+        (when coding-agent-backup-on-apply
+          (coding-agent--backup buffer))
+        (let ((pos (point)))
+          (erase-buffer)
+          (insert text)
+          (unless (string-suffix-p "\n" text) (insert "\n"))
+          (goto-char (min pos (point-max))))
+        (when coding-agent-apply-saves-buffer
+          (save-buffer))
+        (when (and coding-agent-check-after-apply original)
+          (coding-agent--check-and-maybe-revert buffer original))
+        (let ((status (coding-agent--run-check buffer)))
+          (message "coding-agent: applied changes to %s (%s%s)"
+                   (buffer-name buffer)
+                   (if coding-agent-apply-saves-buffer "saved" "unsaved")
+                   (if status (concat "; " status) ""))))))))
 
 (defun coding-agent--begin-review (src original proposed after-fn)
   "Stash state on SRC and start a diff review of ORIGINAL vs PROPOSED."
@@ -780,6 +1170,18 @@ Use this if a request failed in a way that left the buffer marked busy."
   (setq coding-agent--busy nil)
   (message "coding-agent: cleared in-progress flag for %s" (buffer-name)))
 
+(defun coding-agent-toggle-dry-run ()
+  "Toggle `coding-agent-dry-run': when on, proposals are shown but never applied."
+  (interactive)
+  (setq coding-agent-dry-run (not coding-agent-dry-run))
+  (message "coding-agent: dry-run %s" (if coding-agent-dry-run "ON" "off")))
+
+(defun coding-agent-toggle-auto-approve ()
+  "Toggle `coding-agent-auto-approve': when on, proposals apply without asking."
+  (interactive)
+  (setq coding-agent-auto-approve (not coding-agent-auto-approve))
+  (message "coding-agent: auto-approve %s" (if coding-agent-auto-approve "ON" "off")))
+
 (defun coding-agent--report-error (info)
   "Report a gptel error described by INFO in a readable form.
 Includes the HTTP status and the provider error message when present, such as
@@ -817,6 +1219,8 @@ the model-not-found reply from Ollama that usually causes a 404 on /api/chat."
      (t
       (coding-agent--set-busy src nil)
       (coding-agent--stash-raw response)
+      (coding-agent--record-usage info)
+      (coding-agent--history-push 'assistant response)
       (let* ((edit     (coding-agent--apply-edits-to-string original response))
              (proposed (plist-get edit :text))
              (failures (plist-get edit :failures)))
@@ -825,9 +1229,19 @@ the model-not-found reply from Ollama that usually causes a 404 on /api/chat."
                    (length failures)))
         (coding-agent--begin-review
          src original proposed
-         (lambda (apply?)
-           (when apply?
-             (coding-agent--apply-text src proposed original)))))))))
+         (lambda (outcome)
+           (pcase outcome
+             ('apply
+              (unless coding-agent-dry-run
+                (coding-agent--apply-text src proposed original)))
+             (`(skip . ,reason)
+              (coding-agent--add-feedback
+               (format "The user skipped your previous proposal because: %s"
+                       reason))
+              (message "coding-agent: skipped; reason saved for the next refine"))
+             (_
+              (message "coding-agent: changes to %s not applied"
+                       (buffer-name src)))))))))))
 
 (defun coding-agent--dispatch (src prompt original)
   "Mark SRC busy and send PROMPT; ORIGINAL is the source text for the callback.
@@ -835,6 +1249,7 @@ If the request cannot be dispatched (no provider/key, or gptel signals
 synchronously) the busy flag is cleared and the error re-signalled, so SRC is
 never left stuck as \"in progress\"."
   (coding-agent--set-busy src t)
+  (coding-agent--history-push 'user prompt)
   (condition-case err
       (coding-agent--request prompt
         :stream nil
@@ -844,31 +1259,51 @@ never left stuck as \"in progress\"."
      (signal (car err) (cdr err)))))
 
 (defun coding-agent-run (instruction)
-  "Send INSTRUCTION about the current source buffer to the LLM."
+  "Send INSTRUCTION about the current source buffer to the LLM.
+With \\[universal-argument], first enrich the instruction with web
+search results (`coding-agent-enrich-with-search')."
   (interactive "sInstruction: ")
   (coding-agent--ensure-not-busy)
   (let ((file (buffer-file-name)))
-    (when (and file (not (coding-agent--text-file-p file)))
-      (user-error "coding-agent: %s looks like a binary file"
-                  (file-name-nondirectory file))))
+    (when file
+      (unless (coding-agent--text-file-p file)
+        (user-error "coding-agent: %s looks like a binary file"
+                    (file-name-nondirectory file)))
+      (when (coding-agent--hidden-file-p (file-name-nondirectory file))
+        (user-error "coding-agent: refusing to send hidden/internal file %s"
+                    (file-name-nondirectory file)))
+      (when (coding-agent--secret-file-p file)
+        (user-error "coding-agent: refusing to send secret-looking file %s"
+                    (file-name-nondirectory file)))))
+  (when (and current-prefix-arg
+             (not (coding-agent-enrich-with-search)))
+    (user-error "coding-agent: search enrichment failed"))
   (let* ((src    (current-buffer))
          (lang   (coding-agent--buffer-language src))
          (source (buffer-substring-no-properties (point-min) (point-max)))
-         (prompt (coding-agent--build-prompt lang source instruction)))
+         (fb     (coding-agent--consume-feedback))
+         (instr  (if fb (concat instruction "\n\n" fb) instruction))
+         (prompt (coding-agent--build-prompt lang source instr)))
     (message "coding-agent: sending %s buffer to %s (%s)..."
              lang (coding-agent--provider-label) coding-agent-model)
     (coding-agent--dispatch src prompt source)))
 
 (defun coding-agent-refine (instruction)
   "Send a follow-up INSTRUCTION using the last proposal as the new source.
-This gives iterative refinement without re-typing the whole request."
+This gives iterative refinement without re-typing the whole request.
+With \\[universal-argument], first enrich with web search results."
   (interactive "sRefine instruction: ")
   (coding-agent--ensure-not-busy)
+  (when (and current-prefix-arg
+             (not (coding-agent-enrich-with-search)))
+    (user-error "coding-agent: search enrichment failed"))
   (let* ((src  (current-buffer))
          (base (or coding-agent--proposed-text
                    (buffer-substring-no-properties (point-min) (point-max))))
          (lang (coding-agent--buffer-language src))
-         (prompt (coding-agent--build-prompt lang base instruction)))
+         (fb   (coding-agent--consume-feedback))
+         (instr (if fb (concat instruction "\n\n" fb) instruction))
+         (prompt (coding-agent--build-prompt lang base instr)))
     (message "coding-agent: refining with %s (%s)..."
              (coding-agent--provider-label) coding-agent-model)
     (coding-agent--dispatch src prompt base)))
@@ -910,14 +1345,21 @@ The queue lives in a closure, so no global review state is needed."
                (when failures
                  (message "coding-agent: %s: %d search block(s) did not match"
                           rel (length failures)))
-               (message "coding-agent: reviewing %s" rel)
-               (coding-agent--begin-review
-                buf original proposed
-                (lambda (apply?)
-                  (when apply?
-                    (coding-agent--apply-text buf proposed original))
-                  (next)))))))
-      (next))))
+                (message "coding-agent: reviewing %s" rel)
+                (coding-agent--begin-review
+                 buf original proposed
+                 (lambda (outcome)
+                   (pcase outcome
+                     ('apply
+                      (unless coding-agent-dry-run
+                        (coding-agent--apply-text buf proposed original)))
+                     (`(skip . ,reason)
+                      (coding-agent--add-feedback
+                       (format "For %s the user skipped your proposal: %s"
+                               rel reason)))
+                     (_ nil))
+                   (next)))))))
+       (next))))
 
 (defun coding-agent--project-callback (root)
   "Return a gptel callback for a project run rooted at ROOT."
@@ -926,6 +1368,8 @@ The queue lives in a closure, so no global review state is needed."
      ((null response) (coding-agent--report-error info))
      ((not (stringp response)) nil)
      (t
+      (coding-agent--record-usage info)
+      (coding-agent--history-push 'assistant response)
       (coding-agent--stash-raw response "*coding-agent-project-raw*")
       (let ((pairs (coding-agent--parse-multi-file-response response)))
         (if (null pairs)
@@ -937,9 +1381,15 @@ The queue lives in a closure, so no global review state is needed."
 (defun coding-agent-run-project (instruction)
   "Send INSTRUCTION about the whole project to the LLM.
 Collects source files under `default-directory' matching the current
-buffer's language, warns about size, and reviews each returned file."
+buffer's language, warns about size, and reviews each returned file.
+With \\[universal-argument], first enrich with web search results."
   (interactive "sProject instruction: ")
-  (let* ((root  (expand-file-name default-directory))
+  (when (and current-prefix-arg
+             (not (coding-agent-enrich-with-search)))
+    (user-error "coding-agent: search enrichment failed"))
+  (let* ((fb    (coding-agent--consume-feedback))
+         (instruction (if fb (concat instruction "\n\n" fb) instruction))
+         (root  (expand-file-name default-directory))
          (lang  (coding-agent--buffer-language (current-buffer)))
          (files (coding-agent--collect-project-files root lang)))
     (unless files
@@ -995,6 +1445,7 @@ buffer's language, warns about size, and reviews each returned file."
       :stream nil
       :callback
       (lambda (response info)
+        (coding-agent--record-usage info)
         (if (stringp response)
             (progn
               (coding-agent--stash-raw response "*coding-agent-chat-output*")
@@ -1031,8 +1482,643 @@ buffer's language, warns about size, and reviews each returned file."
          (message "coding-agent: unbalanced delimiters in buffer"))))))
 
 ;; ---------------------------------------------------------------------------
-;; Help and transient menu
+;; Skills (~/.agents/skills/<name>/SKILL.md)
 ;; ---------------------------------------------------------------------------
+
+(defun coding-agent--list-skills ()
+  "Return names of skills in `coding-agent-skills-directory'."
+  (let ((dir (expand-file-name coding-agent-skills-directory)))
+    (when (file-directory-p dir)
+      (cl-sort
+       (cl-remove-if-not
+        (lambda (name)
+          (file-exists-p (expand-file-name (concat name "/SKILL.md") dir)))
+        (directory-files dir nil "^[^.]" t))
+       #'string<))))
+
+(defun coding-agent--skill-description (name)
+  "Return the `description:' line from skill NAME's SKILL.md, or nil."
+  (let ((file (expand-file-name (concat name "/SKILL.md")
+                                coding-agent-skills-directory)))
+    (when (file-exists-p file)
+      (with-temp-buffer
+        (insert-file-contents file nil 0 2000)
+        (goto-char (point-min))
+        (when (looking-at "---\n")
+          (when (re-search-forward "^description: *\\(.*\\)$" nil t)
+            (string-trim (match-string 1))))))))
+
+(defun coding-agent-clear-skills ()
+  "Unload all skills from the current buffer."
+  (interactive)
+  (setq coding-agent--skills nil)
+  (message "coding-agent: unloaded all skills for %s" (buffer-name)))
+
+(defun coding-agent-load-skill (name)
+  "Load the skill NAME (a directory under `coding-agent-skills-directory').
+Its SKILL.md is prepended to future prompts from this buffer, and (in an
+agentic session) a summary request is sent to prime the model."
+  (interactive
+   (list (completing-read "Skill: " (coding-agent--list-skills) nil t)))
+  (let ((file (expand-file-name (concat name "/SKILL.md")
+                                coding-agent-skills-directory)))
+    (unless (file-exists-p file)
+      (user-error "coding-agent: no such skill: %s" name))
+    (let ((content (with-temp-buffer
+                     (insert-file-contents file)
+                     (buffer-string))))
+      (if (assoc name coding-agent--skills)
+          (setcdr (assoc name coding-agent--skills) content)
+        (push (cons name content) coding-agent--skills))
+      (coding-agent--history-push 'note (format "skill `%s' loaded" name))
+      (message "coding-agent: loaded skill %s%s"
+               name
+               (let ((d (coding-agent--skill-description name)))
+                 (if d (concat " -- " d) ""))))))
+
+;; ---------------------------------------------------------------------------
+;; Web search (Brave / Exa) -- synchronous, used to enrich the next prompt
+;; ---------------------------------------------------------------------------
+
+(defvar coding-agent-search-enabled nil
+  "When non-nil, enrich every instruction with web search results.")
+
+(defun coding-agent--search-results ()
+  "Return (and clear) the pending search block, if any."
+  (prog1 coding-agent--search-results
+    (setq coding-agent--search-results nil)))
+
+(defun coding-agent--brave-search (query n)
+  "Return (URL . TITLE) search results for QUERY from Brave."
+  (let ((key (getenv "BRAVE_SEARCH_API_KEY")))
+    (unless (and key (not (string-empty-p key)))
+      (user-error "coding-agent: BRAVE_SEARCH_API_KEY is not set"))
+    (let* ((url (format "https://api.search.brave.com/res/v1/web/search?q=%s&count=%d"
+                        (url-hexify-string query) n))
+           (url-request-extra-headers
+            `(("X-Subscription-Token" . ,key)
+              ("Accept" . "application/json")))
+           (buf (url-retrieve-synchronously url t nil 15)))
+      (unless buf (error "Brave search request failed"))
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (re-search-forward "\n\n" nil t)
+            (let* ((data (json-read))
+                   (web  (cdr (assq 'web data)))
+                   (rs   (cdr (assq 'results web))))
+              (mapcar (lambda (r)
+                        (list (cdr (assq 'url r))
+                              (cdr (assq 'title r))
+                              (cdr (assq 'description r))))
+                      rs)))
+        (kill-buffer buf)))))
+
+(defun coding-agent--exa-search (query n)
+  "Return (URL . TITLE . HIGHLIGHT) search results for QUERY from Exa."
+  (let ((key (getenv "EXA_SEARCH_API_KEY")))
+    (unless (and key (not (string-empty-p key)))
+      (user-error "coding-agent: EXA_SEARCH_API_KEY is not set"))
+    (let* ((url-request-method "POST")
+           (url-request-extra-headers
+            `(("Content-Type" . "application/json")
+              ("Authorization" . ,(concat "Bearer " key))))
+           (url-request-data
+            (json-serialize
+             `((query . ,query) (type . "auto") (numResults . ,n)
+               (contents . ((highlights . t))))))
+           (buf (url-retrieve-synchronously "https://api.exa.ai/search" t nil 20)))
+      (unless buf (error "Exa search request failed"))
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (re-search-forward "\n\n" nil t)
+            (let* ((data (json-read))
+                   (rs   (cdr (assq 'results data))))
+              (mapcar (lambda (r)
+                        (let ((hl (cdr (assq 'highlights r))))
+                          (list (cdr (assq 'url r))
+                                (cdr (assq 'title r))
+                                (if (and (vectorp hl) (> (length hl) 0))
+                                    (aref hl 0) ""))))
+                      rs)))
+        (kill-buffer buf)))))
+
+(defun coding-agent-enrich-with-search (&optional query)
+  "Run a web search for QUERY (default: read from minibuffer).
+The results are stashed and prepended to the next instruction sent via
+`coding-agent-run', `coding-agent-refine' or `coding-agent-run-project'.
+Those commands call this when given a prefix argument."
+  (interactive)
+  (let* ((q (or query (read-string "Search query: ")))
+         (results
+          (condition-case err
+              (if (eq coding-agent-search-engine 'exa)
+                  (coding-agent--exa-search q 5)
+                (coding-agent--brave-search q 5))
+            (error (message "coding-agent: search failed: %s"
+                            (error-message-string err))
+                   nil))))
+    (when results
+      (setq coding-agent--search-results
+            (concat (format "[Web search results for: %s]\n" q)
+                    (mapconcat
+                     (lambda (r) (format "- %s\n  %s\n  %s"
+                                         (nth 1 r) (nth 0 r) (or (nth 2 r) "")))
+                     results "\n")
+                    "\n---"))
+      (when (called-interactively-p 'any)
+        (message "coding-agent: search results ready (%d hits); they enrich the next request"
+                 (length results)))
+      t)))
+
+(defun coding-agent-toggle-search ()
+  "Toggle enriching every instruction with web search results."
+  (interactive)
+  (setq coding-agent-search-enabled (not coding-agent-search-enabled))
+  (message "coding-agent: web search %s (engine: %s)"
+           (if coding-agent-search-enabled "ON" "off")
+           coding-agent-search-engine))
+
+;; ---------------------------------------------------------------------------
+;; Session usage statistics
+;; ---------------------------------------------------------------------------
+
+(defvar coding-agent--usage (list :prompt 0 :completion 0)
+  "Cumulative token counts reported by providers this session.")
+
+(defun coding-agent--record-usage (info)
+  "Accumulate token usage from gptel's INFO plist, if present."
+  (let* ((data (plist-get info :data))
+         (usage (and (listp data) (cdr (assq 'usage data)))))
+    (when usage
+      (cl-incf (plist-get coding-agent--usage :prompt)
+               (or (cdr (assq 'prompt_tokens usage)) 0))
+      (cl-incf (plist-get coding-agent--usage :completion)
+               (or (cdr (assq 'completion_tokens usage)) 0)))))
+
+(defun coding-agent-session-usage ()
+  "Show token usage accumulated this session."
+  (interactive)
+  (let ((inhibit-read-only nil))
+    (message "coding-agent session tokens: %d prompt, %d completion, %d total"
+             (plist-get coding-agent--usage :prompt)
+             (plist-get coding-agent--usage :completion)
+             (+ (plist-get coding-agent--usage :prompt)
+                (plist-get coding-agent--usage :completion)))))
+
+;; ---------------------------------------------------------------------------
+;; Agentic mode: gptel tool use
+;; The model drives a multi-turn session with five tools (read_file,
+;; list_dir, grep, run_shell, propose_edit).  All tool errors are converted
+;; to strings so a weak model gets feedback instead of crashing the loop.
+;; The agentic system prompt, repetition guard and diff review mirror the
+;; companion Racket command-line agent (racket-coding-agent).
+;; ---------------------------------------------------------------------------
+
+(defvar coding-agent--agent-session nil
+  "Plist holding the state of the in-flight agentic session, or nil.
+Keys: :buffer :root :iterations :signatures.")
+
+(defun coding-agent--agent-busy-p ()
+  "Return non-nil when an agentic session is running."
+  (and coding-agent--agent-session t))
+
+(defconst coding-agent--agent-system-template
+  "You are an interactive coding assistant working in the directory {root}.
+
+Rules:
+- Use read_file, list_dir and grep to understand the code BEFORE proposing edits.
+- To EDIT an existing file: read_file it first, then pass its exact current
+  contents as \"old\" to propose_edit.
+- To CREATE a new file: call propose_edit with the empty string \"\" as \"old\".
+- One file per propose_edit call.  Keep diffs small and focused.
+- If the user rejects an edit or the check command fails, ask for
+  clarification or try a different approach instead of blindly retrying.
+- run_shell only accepts whitelisted commands: {whitelist}.
+- When you are done, reply with a short natural-language summary of what changed."
+  "System prompt template for `coding-agent-agent-run'.")
+
+(defun coding-agent--agent-system-prompt ()
+  "Build the system prompt for the current agentic session."
+  (let ((root (or (plist-get coding-agent--agent-session :root)
+                  default-directory)))
+    (replace-regexp-in-string
+     (regexp-quote "{root}") root
+     (replace-regexp-in-string
+      (regexp-quote "{whitelist}")
+      (mapconcat #'identity coding-agent-shell-command-whitelist ", ")
+      coding-agent--agent-system-template t t)
+     t t)))
+
+;; -- Tool function bodies --------------------------------------------------
+
+(defun coding-agent--tool-path (relpath)
+  "Resolve RELPATH against the session root; error if it escapes."
+  (let* ((root (or (plist-get coding-agent--agent-session :root)
+                   default-directory))
+         (abs  (expand-file-name relpath root)))
+    (unless (or (string-prefix-p (file-name-as-directory root) abs)
+                (string= abs (directory-file-name root)))
+      (error "coding-agent: refusing path outside the project root"))
+    abs))
+
+(defun coding-agent--tool-read-file (relpath)
+  "Read the file RELPATH under the project root and return its contents."
+  (condition-case err
+      (let* ((abs (coding-agent--tool-path relpath))
+             (base (file-name-nondirectory abs)))
+        (cond
+         ((coding-agent--hidden-file-p base)
+          (format "Error: refusing to read hidden/internal file: %s" relpath))
+         ((coding-agent--secret-file-p abs)
+          (format "Error: refusing to read secret-looking file: %s" relpath))
+         (t (with-temp-buffer
+              (insert-file-contents abs)
+              (buffer-string)))))
+    (error (format "Error reading %s: %s" relpath (error-message-string err)))))
+
+(defun coding-agent--tool-list-dir (relpath)
+  "List RELPATH (default \".\") under the project root, one entry per line.
+Hidden/internal files are excluded; directories end with /."
+  (condition-case err
+      (let* ((abs (coding-agent--tool-path (or relpath "."))))
+        (mapconcat
+         (lambda (name)
+           (if (file-directory-p (expand-file-name name abs))
+               (concat name "/")
+             name))
+         (cl-remove-if #'coding-agent--hidden-file-p
+                       (directory-files abs nil "^[^.]" t))
+         "\n"))
+    (error (format "Error listing %s: %s" relpath (error-message-string err)))))
+
+(defun coding-agent--tool-grep (pattern relpath)
+  "Recursively grep for PATTERN (extended regex) under RELPATH."
+  (condition-case err
+      (let* ((abs (coding-agent--tool-path (or relpath ".")))
+             (exe (if (executable-find "rg")
+                      (list "rg" "--no-heading" "-n" "--color=never"
+                            "--hidden" "--glob" "!.git/**" pattern abs)
+                    (list "grep" "-rnE" pattern abs)))
+             (out (with-temp-buffer
+                    (apply #'process-file (car exe) nil t nil (cdr exe))
+                    (buffer-string))))
+        (coding-agent--truncate out 8000))
+    (error (format "Error running grep: %s" (error-message-string err)))))
+
+(defun coding-agent--tool-run-shell (command)
+  "Run a whitelisted shell COMMAND with no shell (word-split argv); return output."
+  (condition-case err
+      (let ((tokens (split-string (string-trim command) "[ \t]+" t)))
+        (cond
+         ((null tokens) "Error: empty command")
+         ((not (member (car tokens) coding-agent-shell-command-whitelist))
+          (format "Error: command '%s' not whitelisted.  Allowed: %s"
+                  (car tokens)
+                  (mapconcat #'identity coding-agent-shell-command-whitelist ", ")))
+         (t
+          (let* ((root (or (plist-get coding-agent--agent-session :root)
+                           default-directory))
+                 (default-directory root)
+                 (out (with-temp-buffer
+                        (let ((code (apply #'process-file (car tokens) nil t nil
+                                           (cdr tokens))))
+                          (format "%s\n(exit %d)" (buffer-string) code)))))
+            (coding-agent--truncate out 4000)))))
+    (error (format "Error running command: %s" (error-message-string err)))))
+
+(defun coding-agent--tool-propose-edit (relpath old new)
+  "Propose replacing the contents of RELPATH: OLD must match, NEW is written.
+Shows a unified diff; the change is applied on user approval (review supports
+yes/no/skip), then `coding-agent-check-command' runs and its result is
+returned.  Everything is returned as a string for the model."
+  (condition-case err
+      (let* ((abs   (coding-agent--tool-path relpath))
+             (exists (file-exists-p abs))
+             (current (and exists (coding-agent--file-contents abs))))
+        (cond
+         ((null new) "Error: \"new\" is required")
+         ((null old) "Error: \"old\" is required (use the empty string for a new file)")
+         ((and exists (not (string= current old)))
+          (format "Error: stale base: on-disk contents of %s do not match the \"old\" you provided.  Read the file again and retry."
+                  relpath))
+         ((and exists (string= current new))
+          "No changes (proposed content matches the current file)")
+         ((and (not exists) (string-empty-p new))
+          "Error: refused to create an empty file")
+         (t
+          (let ((diff-buf (coding-agent--diff-strings
+                           (or current "") new "*coding-agent-diff*"))
+                (buf (coding-agent--find-or-make-file-buffer abs)))
+            (display-buffer diff-buf)
+            (let ((outcome
+                   (cond
+                    (coding-agent-dry-run 'no)
+                    (coding-agent-auto-approve 'apply)
+                    (t (coding-agent--review-prompt
+                        (format "Apply proposed changes to %s? " relpath))))))
+              (pcase outcome
+                ('apply
+                 (if coding-agent-dry-run
+                     "dry-run: diff shown, file not written"
+                   (unless (file-directory-p (file-name-directory abs))
+                     (make-directory (file-name-directory abs) t))
+                   (with-temp-file abs (insert new))
+                   (let ((after (and (buffer-live-p buf)
+                                     (with-current-buffer buf
+                                       (revert-buffer nil t t)))))
+                     (ignore after))
+                   (let ((status (coding-agent--run-check buf)))
+                     (format "applied%s"
+                             (if status (concat "; " status) "")))))
+                (`(skip . ,reason)
+                 (format "user skipped this change: %s" reason))
+                (_ "user rejected the change")))))))
+    (error (format "Error: propose_edit raised: %s" (error-message-string err)))))
+
+;; -- Tool definitions ------------------------------------------------------
+
+(defun coding-agent--agent-tools ()
+  "Return the list of gptel tools available to the agentic session."
+  (list
+   (gptel-make-tool
+    :name "read_file"
+    :function #'coding-agent--tool-read-file
+    :description "Read and return the contents of a file.  Refuses to read hidden/internal files (~, #...#, dotfiles) or secret-looking files (.env, *.pem, ...)."
+    :args (list '(:name "path" :type string
+                        :description "File path relative to the project root."))
+    :category "coding-agent")
+   (gptel-make-tool
+    :name "list_dir"
+    :function #'coding-agent--tool-list-dir
+    :description "List files and subdirectories (with trailing /) of a directory.  Hidden/internal files are excluded."
+    :args (list '(:name "path" :type string
+                        :description "Directory path relative to the project root; use \".\" for the root.")
+                )
+    :category "coding-agent")
+   (gptel-make-tool
+    :name "grep"
+    :function #'coding-agent--tool-grep
+    :description "Recursively grep files for a pattern (extended regex; uses ripgrep when available)."
+    :args (list '(:name "pattern" :type string
+                        :description "Extended regex pattern to search for.")
+                '(:name "path" :type string
+                        :description "Directory or file path to search, relative to the project root."))
+    :category "coding-agent")
+   (gptel-make-tool
+    :name "run_shell"
+    :function #'coding-agent--tool-run-shell
+    :description (format "Run a whitelisted shell command with no shell interpretation (the string is split on whitespace into an argv).  Whitelist: %s.  Returns combined stdout/stderr and the exit code."
+                         (mapconcat #'identity coding-agent-shell-command-whitelist ", "))
+    :args (list '(:name "command" :type string
+                        :description "The command line, e.g. \"make check\"."))
+    :category "coding-agent")
+   (gptel-make-tool
+    :name "propose_edit"
+    :function #'coding-agent--tool-propose-edit
+    :description "Propose an edit or a new-file creation.  For an existing file, \"old\" must equal the file's exact current contents (read it first with read_file); for a new file pass the empty string.  The user is shown a unified diff with yes/no/skip; on approval the file is written and the check command runs.  The result string says whether the edit was applied, rejected, or skipped (with the user's reason)."
+    :args (list '(:name "path" :type string
+                        :description "Path of the file to edit or create, relative to the project root.")
+                '(:name "old" :type string
+                        :description "Exact current contents of the file, or the empty string for a new file.")
+                '(:name "new" :type string
+                        :description "The proposed new contents of the file, in full."))
+    :category "coding-agent")))
+
+;; -- Agentic callback with repetition guard --------------------------------
+
+(defconst coding-agent--agent-repeat-window 5
+  "Number of recent tool-call batches remembered for loop detection.")
+
+(defconst coding-agent--agent-repeat-limit 2
+  "Identical tool-call batches seen within the window before halting.")
+
+(defun coding-agent--call-signature (calls)
+  "Return a sorted signature string list for gptel tool CALLS."
+  (sort (mapcar (lambda (c)
+                  (format "%s|%S" (gptel-tool-name (car c)) (cdr c)))
+                calls)
+        #'string<))
+
+(defun coding-agent--agent-callback (response info)
+  "Handle RESPONSE/INFO for the agentic session, looping on tool calls."
+  (let* ((session coding-agent--agent-session)
+         (src (plist-get session :buffer)))
+    (cond
+     ;; Terminal states ----------------------------------------------------
+     ((null response)
+      (setq coding-agent--agent-session nil)
+      (coding-agent--set-busy (or src (current-buffer)) nil)
+      (coding-agent--report-error info))
+     ((eq response 'abort)
+      (setq coding-agent--agent-session nil)
+      (coding-agent--set-busy (or src (current-buffer)) nil)
+      (message "coding-agent: agentic session aborted"))
+     ((stringp response)                ; final assistant message, done
+      (coding-agent--record-usage info)
+      (coding-agent--history-push 'assistant response)
+      (setq coding-agent--agent-session nil)
+      (coding-agent--set-busy (or src (current-buffer)) nil)
+      (message "coding-agent: agentic session complete; summary in *coding-agent-history*")
+      (coding-agent-show-history))
+     ;; Tool calls ----------------------------------------------------------
+     ((and (consp response) (eq (car response) 'tool-result)) nil)
+     ((and (consp response) (eq (car response) 'tool-call))
+      (coding-agent--record-usage info)
+      (let* ((calls (cdr response))
+             (sig   (coding-agent--call-signature calls))
+             (seen  (plist-get session :signatures))
+             (n     (1+ (cl-count sig seen :test #'equal))))
+        (if (>= n coding-agent--agent-repeat-limit)
+            (progn
+              (setq coding-agent--agent-session nil)
+              (coding-agent--set-busy (or src (current-buffer)) nil)
+              (message "coding-agent: stopped -- the model repeated the identical tool call(s) %d times; it may be stuck"
+                       coding-agent--agent-repeat-limit))
+          (setf (plist-get session :signatures)
+                (last (cons sig seen) coding-agent--agent-repeat-window))
+          ;; Run each tool and hand results back through gptel's callback.
+          (dolist (call calls)
+            (pcase-let ((`(,tool ,args ,cb) call))
+              (coding-agent--history-push
+               'note (format "tool call: %s %S" (gptel-tool-name tool) args))
+              (let ((result
+                     (condition-case err
+                         (apply (gptel-tool-function tool)
+                                (mapcar #'cdr args)) ; args are (NAME . VALUE)
+                       (error
+                        (format "Error: tool '%s' raised: %s"
+                                (gptel-tool-name tool)
+                                (error-message-string err))))))
+                (coding-agent--history-push
+                 'note (format "tool result: %s"
+                               (coding-agent--truncate (format "%s" result) 500)))
+                (funcall cb result)))))))
+     (t nil))                           ; reasoning chunks: ignore
+    ;; Iteration guard
+    (when coding-agent--agent-session
+      (let ((iters (cl-incf (plist-get coding-agent--agent-session :iterations))))
+        (when (>= iters coding-agent-agent-max-iterations)
+          (setq coding-agent--agent-session nil)
+          (coding-agent--set-busy (or src (current-buffer)) nil)
+          (message "coding-agent: stopped after %d iterations (max)"
+                   coding-agent-agent-max-iterations))))))
+
+(defun coding-agent-agent-run (instruction)
+  "Run an agentic coding session: the model uses tools to satisfy INSTRUCTION.
+Starts at the project root (directory containing .git, else
+`default-directory') and lets the model call read_file, list_dir, grep,
+run_shell and propose_edit.  With \\[universal-argument], first enrich with
+web search results."
+  (interactive "sAgentic instruction: ")
+  (when coding-agent--agent-session
+    (user-error "coding-agent: an agentic session is already running"))
+  (coding-agent--ensure-not-busy)
+  (coding-agent--ensure-key)
+  (when (and current-prefix-arg
+             (not (coding-agent-enrich-with-search)))
+    (user-error "coding-agent: search enrichment failed"))
+  (let* ((root (or (locate-dominating-file default-directory ".git")
+                   (expand-file-name default-directory)))
+         (fb   (coding-agent--consume-feedback))
+         (instr (string-join
+                 (delq nil (list instruction fb (coding-agent--search-results)))
+                 "\n\n"))
+         (system (concat (coding-agent--skill-preamble)
+                         (coding-agent--agent-system-prompt)
+                         (format "\n\nWorking directory: %s" root)))
+         (gptel-tools (coding-agent--agent-tools))
+         (gptel-use-tools t)
+         (gptel-max-tokens 32768))
+    (coding-agent--ensure-model-registered)
+    (setq coding-agent--agent-session
+          (list :buffer (current-buffer) :root root :iterations 0
+                :signatures nil))
+    (coding-agent--set-busy (current-buffer) t)
+    (coding-agent--history-push 'user instr)
+    (message "coding-agent: starting agentic session in %s (%s/%s)..."
+             root (coding-agent--provider-label) coding-agent-model)
+    (let ((gptel-backend coding-agent-backend)
+          (gptel-model coding-agent-model))
+      (gptel-request instr
+        :stream nil
+        :system system
+        :callback #'coding-agent--agent-callback))))
+
+(defun coding-agent-agent-stop ()
+  "Abort a running agentic session."
+  (interactive)
+  (when coding-agent--agent-session
+    (setq coding-agent--agent-session nil)
+    (coding-agent--set-busy (current-buffer) nil)
+    (message "coding-agent: agentic session stopped")))
+
+;; ---------------------------------------------------------------------------
+;; Conversation history, context display and compaction
+;; ---------------------------------------------------------------------------
+
+(defvar-local coding-agent--history nil
+  "Chronological list of (ROLE . TEXT) entries for this buffer.
+ROLE is one of `user', `assistant', `note' or `summary'.")
+
+(defun coding-agent--history-push (role text)
+  "Append (ROLE . TEXT) to the current buffer's history."
+  (setq coding-agent--history
+        (append coding-agent--history (list (cons role text)))))
+
+(defun coding-agent-show-history ()
+  "Show the conversation history for this buffer in a popup."
+  (interactive)
+  (let ((history coding-agent--history))
+    (with-current-buffer (get-buffer-create "*coding-agent-history*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (if (null history)
+            (insert "(no history for this buffer)\n")
+          (dolist (entry history)
+            (insert (propertize (format "\n--- %s ---\n" (car entry))
+                                'face 'bold)
+                    (or (cdr entry) "")
+                    "\n"))))
+      (goto-char (point-min))
+      (special-mode)
+      (display-buffer (current-buffer))
+      (current-buffer))))
+
+(defun coding-agent-show-context ()
+  "Show a tabular summary of this buffer's context with estimated tokens."
+  (interactive)
+  (let ((entries coding-agent--history)
+        (total 0))
+    (with-current-buffer (get-buffer-create "*coding-agent-context*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "%3s  %-9s %7s  %s\n" "#" "role" "chars" "preview"))
+        (insert (format "%3s  %-9s %7s  %s\n" "---" "---------" "-------"
+                        (make-string 60 ?-)))
+        (let ((i 0))
+          (dolist (e entries)
+            (cl-incf i)
+            (cl-incf total (length (cdr e)))
+            (insert
+             (format "%3d  %-9s %7d  %s\n"
+                     i (symbol-name (car e)) (length (cdr e))
+                     (truncate-string-to-width
+                      (replace-regexp-in-string "[\n\t]+" " " (cdr e))
+                      70 nil nil "...")))))
+        (goto-char (point-min)))
+      (special-mode)
+      (display-buffer (current-buffer))
+      (message "coding-agent: %d entries, %d chars, ~%d tokens (est.)"
+               (length entries) total (ceiling total 4))
+      (current-buffer))))
+
+(defconst coding-agent--compact-prompt
+  "You are a context compactor for a coding assistant.  Summarize the
+conversation transcript into a compact brief that will replace it.
+Preserve: the user's goals and instructions, decisions made, files created
+or modified (with paths), important code and tool-output details, and
+outstanding tasks.  Write dense bullets, no preamble."
+  "System prompt used by `coding-agent-compact-context'.")
+
+(defun coding-agent--history-transcript ()
+  "Render history as a single transcript string."
+  (mapconcat (lambda (e) (format "### %s\n%s" (car e) (cdr e)))
+             coding-agent--history "\n\n"))
+
+(defun coding-agent-compact-context ()
+  "Replace the buffer's history with an LLM-generated summary.
+Asks the model to compact the transcript and folds the result back in as
+a single `summary' entry."
+  (interactive)
+  (coding-agent--ensure-not-busy)
+  (cond
+   ((<= (length coding-agent--history) 1)
+    (message "coding-agent: nothing to compact"))
+   (t
+    (let* ((src (current-buffer))
+           (count (length coding-agent--history))
+           (transcript (coding-agent--history-transcript)))
+      (coding-agent--set-busy src t)
+      (coding-agent--request
+       (concat coding-agent--compact-prompt "\n\nTRANSCRIPT:\n" transcript)
+       :stream nil
+       :callback
+       (lambda (response info)
+         (when (buffer-live-p src)
+           (with-current-buffer src
+             (coding-agent--set-busy src nil)
+             (coding-agent--record-usage info)
+             (if (not (stringp response))
+                 (coding-agent--report-error info)
+               (setq coding-agent--history
+                     (list (cons 'summary
+                                 (concat "[Earlier conversation compacted. "
+                                         "Continue from where it left off.]\n\n"
+                                         response))))
+               (message "coding-agent: compacted %d entries -> 1 (~%d chars)"
+                        count (length response)))))))))))
 
 (defun coding-agent-help ()
   "Show a short coding-agent cheatsheet."
@@ -1040,26 +2126,40 @@ buffer's language, warns about size, and reviews each returned file."
   (message
    (concat
     "coding-agent\n"
-    "  C-c a r  run (file)      C-c a p  run (project)\n"
+    "  C-c a r  run (file)      C-c a p  run (project)     C-c a R  agentic run\n"
     "  C-c a f  refine last     C-c a a  apply proposed\n"
     "  C-c a e  eval/check      C-c a .  menu   C-c a h  help\n"
     "  C-c a m  change model/provider   C-c a g  reset busy flag\n"
+    "  C-c a H  history  C-c a T context  C-c a C compact  C-c a u tokens\n"
+    "  C-c a /  load skill   C-c a s search+enrich  C-c a S search on/off\n"
     "  C-c l r  send region     C-c l c  chat buffer\n"
-    "Flow: run -> read *coding-agent-diff* -> answer y to apply (or M-x coding-agent-apply-proposed)")))
+    "Reviews: y = apply, n = reject, s = skip with a reason sent to the model.\n"
+    "Prefix arg on run/refine/project/agent enriches the prompt with web search.")))
 
 (transient-define-prefix coding-agent-dispatch ()
   "Coding-agent command menu."
   [["Edit"
     ("r" "Run on file"      coding-agent-run)
     ("p" "Run on project"   coding-agent-run-project)
+    ("R" "Agentic run"      coding-agent-agent-run)
     ("f" "Refine last"      coding-agent-refine)
     ("a" "Apply proposed"   coding-agent-apply-proposed)]
+   ["Session"
+    ("H" "History"          coding-agent-show-history)
+    ("T" "Context summary"  coding-agent-show-context)
+    ("C" "Compact context"  coding-agent-compact-context)
+    ("u" "Token usage"      coding-agent-session-usage)
+    ("g" "Reset busy flag"  coding-agent-reset)
+    ("X" "Stop agent"       coding-agent-agent-stop)]
+   ["Context"
+    ("/" "Load skill"       coding-agent-load-skill)
+    ("?" "Clear skills"     coding-agent-clear-skills)
+    ("s" "Web search"       coding-agent-enrich-with-search)
+    ("S" "Toggle search"    coding-agent-toggle-search)]
    ["Other"
     ("e" "Eval / check buffer"    coding-agent-eval-buffer-for-language)
     ("m" "Model / provider"       coding-agent-model-change)
-    ("g" "Reset busy flag"        coding-agent-reset)
     ("c" "Chat: region/buffer"    coding-agent-send-region-or-buffer)
-    ("C" "Open chat buffer"       coding-agent-open-chat)
     ("h" "Help"                   coding-agent-help)]])
 
 ;; ---------------------------------------------------------------------------
@@ -1070,12 +2170,23 @@ buffer's language, warns about size, and reviews each returned file."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "r") #'coding-agent-run)
     (define-key map (kbd "p") #'coding-agent-run-project)
+    (define-key map (kbd "R") #'coding-agent-agent-run)
+    (define-key map (kbd "X") #'coding-agent-agent-stop)
     (define-key map (kbd "f") #'coding-agent-refine)
     (define-key map (kbd "a") #'coding-agent-apply-proposed)
     (define-key map (kbd "e") #'coding-agent-eval-buffer-for-language)
     (define-key map (kbd "m") #'coding-agent-model-change)
     (define-key map (kbd "g") #'coding-agent-reset)
     (define-key map (kbd "h") #'coding-agent-help)
+    (define-key map (kbd "H") #'coding-agent-show-history)
+    (define-key map (kbd "T") #'coding-agent-show-context)
+    (define-key map (kbd "C") #'coding-agent-compact-context)
+    (define-key map (kbd "u") #'coding-agent-session-usage)
+    (define-key map (kbd "/") #'coding-agent-load-skill)
+    (define-key map (kbd "s") #'coding-agent-enrich-with-search)
+    (define-key map (kbd "S") #'coding-agent-toggle-search)
+    (define-key map (kbd "D") #'coding-agent-toggle-dry-run)
+    (define-key map (kbd "A") #'coding-agent-toggle-auto-approve)
     (define-key map (kbd ".") #'coding-agent-dispatch)
     map)
   "Keymap bound under the \"C-c a\" prefix by `coding-agent-mode'.")
@@ -1102,6 +2213,10 @@ buffer's language, warns about size, and reviews each returned file."
 ;;;###autoload
 (define-globalized-minor-mode global-coding-agent-mode
   coding-agent-mode coding-agent--maybe-enable)
+
+;; Load JSON profile providers once at startup (no-op when the config files
+;; are absent); must come after the provider variables above.
+(coding-agent-load-harness-config)
 
 (provide 'coding-agent)
 ;;; coding-agent.el ends here
