@@ -260,6 +260,7 @@ are appended here by `coding-agent-load-harness-config'.")
 ;;                                "endpoint": "https://.../v1/chat/completions",
 ;;                                "api_key_env": "SOME_KEY",   (optional)
 ;;                                "model": "model-id",
+;;                                "thinking": false,           (mlx: disable reasoning)
 ;;                                "generation": {"temperature": 0.6,
 ;;                                               "max_tokens": 32768} } } }
 ;; "type": "openai" and "mlx" map to an OpenAI-compatible gptel backend (mlx
@@ -325,6 +326,13 @@ Non-alist values are replaced wholesale."
       "https"
     "http"))
 
+(defun coding-agent--thinking-off-p (thinking)
+  "Return non-nil when the profile's THINKING field requests thinking off.
+THINKING is the raw JSON value of the \"thinking\" key: JSON false arrives
+as :json-false; accept the string \"false\" too."
+  (or (eq thinking :json-false)
+      (equal thinking "false")))
+
 (defun coding-agent--provider-from-profile (name profile)
   "Build a provider entry from a JSON provider PROFILE named NAME.
 Return (KEY :label ... :backend ... :models ... :env ...), or nil."
@@ -335,6 +343,7 @@ Return (KEY :label ... :backend ... :models ... :env ...), or nil."
          (gen      (cdr (assq 'generation profile)))
          (max-tok  (and (listp gen) (cdr (assq 'max_tokens gen))))
          (temp     (and (listp gen) (cdr (assq 'temperature gen))))
+         (thinking (cdr (assq 'thinking profile)))
          (models   (list (intern (or model "default"))))
          (key      (intern name)))
     (cond
@@ -356,7 +365,10 @@ Return (KEY :label ... :backend ... :models ... :env ...), or nil."
                       "/v1/chat/completions"))
             (proto (coding-agent--endpoint-to-protocol endpoint))
             (req  (append (when (numberp temp) `(:temperature ,temp))
-                          (when (integerp max-tok) `(:max_tokens ,max-tok)))))
+                          (when (integerp max-tok) `(:max_tokens ,max-tok))
+                          (when (coding-agent--thinking-off-p thinking)
+                            `(:chat_template_kwargs
+                              (:enable_thinking :json-false))))))
         `(,key :label ,name
           :backend ,(apply #'gptel-make-openai (copy-sequence name)
                            :host host :endpoint path :protocol proto
