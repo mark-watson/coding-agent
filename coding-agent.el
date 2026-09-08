@@ -262,9 +262,9 @@ are appended here by `coding-agent-load-harness-config'.")
 ;;                                "model": "model-id",
 ;;                                "generation": {"temperature": 0.6,
 ;;                                               "max_tokens": 32768} } } }
-;; "type": "openai" maps to an OpenAI-compatible gptel backend; "mlx" and the
-;; legacy "ollama" both map to an Ollama-style gptel backend (which also
-;; speaks to MLX/Ollama OpenAI-compatible shims at the given endpoint).
+;; "type": "openai" and "mlx" map to an OpenAI-compatible gptel backend (mlx
+;; serves /v1/chat/completions); the legacy "ollama" maps to gptel's native
+;; Ollama backend (/api/chat).
 ;; Project-local entries deep-merge over (and win against) the global file.
 ;; ---------------------------------------------------------------------------
 
@@ -318,6 +318,13 @@ Non-alist values are replaced wholesale."
                (url-filename u)
              (concat "/" (url-filename u)))))))
 
+(defun coding-agent--endpoint-to-protocol (endpoint)
+  "Return \"http\" or \"https\" from ENDPOINT, defaulting to \"http\"."
+  (if (and endpoint
+           (string-prefix-p "https" endpoint))
+      "https"
+    "http"))
+
 (defun coding-agent--provider-from-profile (name profile)
   "Build a provider entry from a JSON provider PROFILE named NAME.
 Return (KEY :label ... :backend ... :models ... :env ...), or nil."
@@ -331,8 +338,8 @@ Return (KEY :label ... :backend ... :models ... :env ...), or nil."
          (models   (list (intern (or model "default"))))
          (key      (intern name)))
     (cond
-     ;; Local MLX server / Ollama-style endpoint: gptel's ollama backend.
-     ((member type '("mlx" "ollama"))
+     ;; Native Ollama protocol endpoint (/api/chat).
+     ((string= type "ollama")
       `(,key :label ,name
         :backend ,(gptel-make-ollama (copy-sequence name)
                     :host (or (coding-agent--endpoint-to-host endpoint)
@@ -341,6 +348,21 @@ Return (KEY :label ... :backend ... :models ... :env ...), or nil."
                     :models models
                     :request-params `(:options (:num_ctx ,coding-agent-ollama-num-ctx)))
         :models ,models :env nil))
+     ;; Local MLX server: OpenAI-compatible, endpoint path respected, no key.
+     ((string= type "mlx")
+      (let ((host (or (coding-agent--endpoint-to-host endpoint)
+                      "localhost:11434"))
+            (path (or (coding-agent--endpoint-to-path endpoint)
+                      "/v1/chat/completions"))
+            (proto (coding-agent--endpoint-to-protocol endpoint))
+            (req  (append (when (numberp temp) `(:temperature ,temp))
+                          (when (integerp max-tok) `(:max_tokens ,max-tok)))))
+        `(,key :label ,name
+          :backend ,(apply #'gptel-make-openai (copy-sequence name)
+                           :host host :endpoint path :protocol proto
+                           :stream t :models models
+                           (when req (list :request-params req)))
+          :models ,models :env nil)))
      ;; OpenAI-compatible REST endpoint (Fireworks and compatible servers).
      (t
       (let ((host (or (coding-agent--endpoint-to-host endpoint)
@@ -2046,27 +2068,47 @@ ROLE is one of `user', `assistant', `note' or `summary'.")
       (display-buffer (current-buffer))
       (current-buffer))))
 
+(defun coding-agent--wrap-text (text width)
+  "Wrap TEXT at word boundaries to WIDTH columns.  Return a list of lines."
+  (let ((words (split-string text " +" t))
+        (lines '())
+        (cur ""))
+    (dolist (w words)
+      (if (string-empty-p cur)
+          (setq cur w)
+        (let ((candidate (concat cur " " w)))
+          (if (<= (length candidate) width)
+              (setq cur candidate)
+            (push cur lines)
+            (setq cur w)))))
+    (when (not (string-empty-p cur))
+      (push cur lines))
+    (nreverse lines)))
+
 (defun coding-agent-show-context ()
-  "Show a tabular summary of this buffer's context with estimated tokens."
+  "Show a multiline summary of this buffer's context with estimated tokens."
   (interactive)
   (let ((entries coding-agent--history)
-        (total 0))
+        (total 0)
+        (width 88))
     (with-current-buffer (get-buffer-create "*coding-agent-context*")
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (format "%3s  %-9s %7s  %s\n" "#" "role" "chars" "preview"))
-        (insert (format "%3s  %-9s %7s  %s\n" "---" "---------" "-------"
-                        (make-string 60 ?-)))
+        (insert "  #  role        chars  preview\n")
+        (insert "---  ---------  -------  " (make-string (min 40 width) ?-) "\n")
         (let ((i 0))
           (dolist (e entries)
             (cl-incf i)
-            (cl-incf total (length (cdr e)))
-            (insert
-             (format "%3d  %-9s %7d  %s\n"
-                     i (symbol-name (car e)) (length (cdr e))
-                     (truncate-string-to-width
-                      (replace-regexp-in-string "[\n\t]+" " " (cdr e))
-                      70 nil nil "...")))))
+            (let* ((content (cdr e))
+                   (flat (replace-regexp-in-string "[\n\t]+" " " content))
+                   (lines (or (coding-agent--wrap-text flat (- width 25)) '("")))
+                   (indent (make-string 25 ? )))
+              (cl-incf total (length content))
+              (insert (format "%3d  %-9s %7d  %s\n"
+                              i (symbol-name (car e)) (length content)
+                              (pop lines)))
+              (dolist (l lines)
+                (insert indent l "\n")))))
         (goto-char (point-min)))
       (special-mode)
       (display-buffer (current-buffer))
